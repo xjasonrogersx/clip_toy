@@ -100,3 +100,7 @@ A fluffy animal with 4 legs
 
 ![alt text](image-11.png)
 
+
+
+242 Mb od weighs in this onnx sidecar file
+

@@ -217,6 +217,50 @@ class ClipEngine:
 			LOGGER.info("Text embedding finished in %.2fs: dimensions=%d", perf_counter() - started, result.size)
 			return result, tuple(inputs["input_ids"].shape), prompt_token_count, inference_ms
 
+	def export_text_onnx(self) -> Path:
+		with self.lock:
+			import torch
+
+			_, model = self._load()
+			output_path = DATA_DIR / "clip-text-encoder.onnx"
+			class TextEncoder(torch.nn.Module):
+				def __init__(self, clip_model):
+					super().__init__()
+					self.text_model = clip_model.text_model
+					self.text_projection = clip_model.text_projection
+
+				def forward(self, input_ids, attention_mask):
+					output = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
+					projected = self.text_projection(output.pooler_output)
+					return projected / torch.linalg.vector_norm(projected, dim=-1, keepdim=True).clamp_min(1e-12)
+
+			wrapper = TextEncoder(model).eval()
+			dummy_input_ids = torch.zeros((1, 77), dtype=torch.long)
+			dummy_attention_mask = torch.ones((1, 77), dtype=torch.long)
+			output_path.parent.mkdir(parents=True, exist_ok=True)
+			temporary_path = output_path.with_suffix(".tmp.onnx")
+			try:
+				torch.onnx.export(
+					wrapper,
+					(dummy_input_ids, dummy_attention_mask),
+					str(temporary_path),
+					input_names=["input_ids", "attention_mask"],
+					output_names=["text_embedding"],
+					dynamic_axes={
+						"input_ids": {0: "batch", 1: "sequence"},
+						"attention_mask": {0: "batch", 1: "sequence"},
+						"text_embedding": {0: "batch"},
+					},
+					opset_version=17,
+					do_constant_folding=True,
+				)
+				temporary_path.replace(output_path)
+			except Exception:
+				temporary_path.unlink(missing_ok=True)
+				raise
+			LOGGER.info("Exported CLIP text encoder to %s", output_path)
+			return output_path
+
 
 STORE = VectorStore()
 ENGINE = ClipEngine()
@@ -239,7 +283,7 @@ def image_page() -> str:
 
 
 def text_page() -> str:
-	body = f'''<header><div><h1>Text search</h1><p>Encode a prompt and find the cached images with the closest CLIP meaning.</p></div>{COMMON_NAV}</header><section class="panel"><label for="prompt">Prompt</label><textarea id="prompt" placeholder="a quiet red house beside the sea"></textarea><label for="padding">Additional token padding <output id="padding-value">0</output></label><input id="padding" type="range" min="0" max="77" value="0" step="1"><button id="run">Generate text vector</button><div id="status" class="status">Ready · image and text vectors share one CLIP space</div><div id="meta" class="meta"></div><div id="vector" class="vector"></div></section><section class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap"><h2 style="margin:0">Prompt pipeline</h2><button id="save-text-graph" type="button">Save PNG</button></div><div id="text-graph" class="graph"></div></section><section class="panel"><h2>Most similar images</h2><div id="results" class="results"><p>Run a prompt to search cached images.</p></div></section>'''
+	body = f'''<header><div><h1>Text search</h1><p>Encode a prompt and find the cached images with the closest CLIP meaning.</p></div>{COMMON_NAV}</header><section class="panel"><label for="prompt">Prompt</label><textarea id="prompt" placeholder="a quiet red house beside the sea"></textarea><label for="padding">Additional token padding <output id="padding-value">0</output></label><input id="padding" type="range" min="0" max="77" value="0" step="1"><button id="run">Generate text vector</button><button id="export-text-onnx" type="button">Export text encoder ONNX</button><div id="status" class="status">Ready · image and text vectors share one CLIP space</div><div id="meta" class="meta"></div><div id="vector" class="vector"></div></section><section class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap"><h2 style="margin:0">Prompt pipeline</h2><button id="save-text-graph" type="button">Save PNG</button></div><div id="text-graph" class="graph"></div></section><section class="panel"><h2>Most similar images</h2><div id="results" class="results"><p>Run a prompt to search cached images.</p></div></section>'''
 	script = '''const $=id=>document.getElementById(id);function draw(vector){const box=$('vector');box.replaceChildren();const a=vector.sample||[],m=Math.max(...a.map(v=>Math.abs(v)),1e-6);a.forEach(v=>{const e=document.createElement('i');e.className='bar'+(v<0?' negative':'');e.style.height=`${Math.max(3,Math.abs(v)/m*100)}%`;e.title=v;box.append(e)})}function results(items){$('results').innerHTML=items.map(x=>`<article class="result"><img src="/api/images/${x.id}"><b>${Number(x.score).toFixed(4)}</b><br><span class="meta">${x.filename}</span></article>`).join('')||'<p>No cached images match yet.</p>'}const graph=new LiteGraph.LGraph(),canvas=document.createElement('canvas');canvas.width=1100;canvas.height=400;$('text-graph').append(canvas);const gc=new LiteGraph.LGraphCanvas(canvas,graph);function Stage(){this.properties={}}LiteGraph.registerNodeType('clip/stage',Stage);function node(title,x,y,color){const n=LiteGraph.createNode('clip/stage');n.title=title;n.pos=[x,y];n.size=[220,150];n.color=color;n.bgcolor='#18333f';return n}const prompt=node('Prompt',40,120,'#e28b54');prompt.addOutput('text','string');prompt.addWidget('text','Value','Waiting',v=>{prompt.properties.value=v;prompt.setOutputData(0,v)});const tokenizer=node('Tokenizer',330,120,'#4fc5bd');tokenizer.addInput('text','string');tokenizer.addOutput('tokens','tensor');tokenizer.addWidget('text','Status','Waiting',()=>{},{read_only:true});const clip=node('CLIP encoder',620,120,'#9b8de1');clip.addInput('tokens','tensor');clip.addOutput('embedding','vector');clip.addWidget('text','Status','Waiting',()=>{},{read_only:true});const output=node('Output vector',910,120,'#e28b54');output.addInput('embedding','vector');output.addWidget('text','Dimensions','—',()=>{},{read_only:true});[prompt,tokenizer,clip,output].forEach(n=>graph.add(n));prompt.connect(0,tokenizer,0);tokenizer.connect(0,clip,0);clip.connect(0,output,0);function set(n,k,v){const w=n.widgets.find(x=>x.name===k);if(w)w.value=String(v)}function fit(){gc.ds.scale=.72;gc.ds.offset=[20,20];gc.setDirty(true,true)}fit();$('run').onclick=async()=>{const value=$('prompt').value.trim();if(!value){$('status').textContent='Enter a prompt first.';return}set(prompt,'Value',value);set(tokenizer,'Status','Tokenizing…');set(clip,'Status','Encoding…');$('status').textContent='Encoding prompt…';try{const r=await fetch('/api/text/embed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:value})}),j=await r.json();if(!r.ok)throw Error(j.error);set(tokenizer,'Status',`${j.tokens} tokens`);set(clip,'Status','Complete');set(output,'Dimensions',j.vector.dimensions);$('meta').textContent=JSON.stringify(j.vector,null,2);draw(j.vector);results(j.matches);$('status').textContent=`Found ${j.matches.length} cached image(s).`}catch(x){$('status').textContent=x.message;$('status').className='status error';set(clip,'Status','Failed')}};'''
 	script = script.replace("prompt.addWidget('text','Value','Waiting',v=>{prompt.properties.value=v;prompt.setOutputData(0,v)});", "prompt.addWidget('text','Value','Waiting',v=>{prompt.properties.value=v;prompt.setOutputData(0,v)});prompt.addWidget('text','Prompt text','Waiting',()=>{}, {read_only:true});")
 	script = script.replace("tokenizer.addWidget('text','Status','Waiting',()=>{},{read_only:true});", "tokenizer.addWidget('text','Status','Waiting',()=>{},{read_only:true});tokenizer.addWidget('text','Token count','—',()=>{},{read_only:true});tokenizer.addWidget('text','Input tensor','—',()=>{},{read_only:true});")
@@ -251,6 +295,7 @@ def text_page() -> str:
 	script += '''const similarPanel=$('results').closest('.panel');const pipelinePanel=$('text-graph').closest('.panel');similarPanel.after(pipelinePanel);const similarList=$('results');function formatSimilar(){const cards=[...similarList.querySelectorAll('.result')];cards.sort((a,b)=>Number(b.querySelector('b')?.textContent||-Infinity)-Number(a.querySelector('b')?.textContent||-Infinity)).forEach(card=>similarList.append(card));cards.forEach(card=>{if(card.dataset.formatted)return;const image=card.querySelector('img');if(!image)return;const imageId=image.src.split('/').pop();const score=Number(card.querySelector('b')?.textContent||0);const filename=card.querySelector('.meta')?.textContent||'';card.dataset.formatted='true';card.style.cssText='grid-column:1/-1;display:grid;grid-template-columns:minmax(140px,220px) 1fr;gap:16px;align-items:start';card.innerHTML=`<div><div style="font-weight:bold;font-size:1.15rem">Confidence<br>${score.toFixed(4)}</div><img src="/api/images/${imageId}" alt="${filename}"></div><div><b>${filename}</b><div class="vector" data-similar-vector aria-label="Vector visualization for ${filename}"></div><span class="meta" data-similar-meta>Loading vector…</span></div>`;fetch(`/api/images/${imageId}/vector`).then(response=>response.json()).then(vector=>{if(!vector.dimensions)return;drawIntoSimilar(card.querySelector('[data-similar-vector]'),vector);card.querySelector('[data-similar-meta]').textContent=`${vector.dimensions} dimensions · mean ${vector.mean}`}).catch(()=>{card.querySelector('[data-similar-meta]').textContent='Vector unavailable'})})}function drawIntoSimilar(box,vector){box.replaceChildren();const sample=vector.sample||[];const max=Math.max(...sample.map(value=>Math.abs(value)),1e-6);sample.forEach(value=>{const bar=document.createElement('i');bar.className='bar'+(value<0?' negative':'');bar.style.height=`${Math.max(3,Math.abs(value)/max*100)}%`;bar.title=value;box.append(bar)})}new MutationObserver(formatSimilar).observe(similarList,{childList:true});formatSimilar();'''
 	script = script.replace('new MutationObserver(formatSimilar).observe(similarList,{childList:true});formatSimilar();', 'const renderSimilarResults=results;results=(items)=>{renderSimilarResults(items);formatSimilar()};formatSimilar();')
 	script = script.replace("similarPanel.after(pipelinePanel);", "")
+	script += "$('export-text-onnx').onclick=()=>{window.location.href='/api/text/export-onnx'};"
 	script += '''function saveTextGraph(){const button=$('save-text-graph');button.disabled=true;button.textContent='Rendering…';let exporter=null;try{const nodes=graph._nodes;if(!nodes.length)throw Error('There are no graph nodes to export.');const padding=48,topPadding=112,minX=Math.min(...nodes.map(node=>node.pos[0])),minY=Math.min(...nodes.map(node=>node.pos[1])),maxX=Math.max(...nodes.map(node=>node.pos[0]+node.size[0])),maxY=Math.max(...nodes.map(node=>node.pos[1]+node.size[1])),scale=Math.min(2,12000/(maxX-minX+padding*2),12000/(maxY-minY+topPadding+padding)),exportCanvas=document.createElement('canvas');exportCanvas.width=Math.ceil((maxX-minX)*scale+padding*2);exportCanvas.height=Math.ceil((maxY-minY)*scale+topPadding+padding);exporter=new LiteGraph.LGraphCanvas(exportCanvas,graph,{skip_render:true,skip_events:true});exporter.background_image=null;exporter.clear_background=true;exporter.clear_background_color=null;exporter.show_info=false;exporter.render_canvas_border=false;exporter.node_title_color='#000000';exporter.ds.scale=scale;exporter.ds.offset=[padding/scale-minX,topPadding/scale-minY];exporter.onRenderBackground=()=>true;exporter.draw(true,true);exportCanvas.toBlob(blob=>{if(!blob)throw Error('The browser could not create the PNG export.');const url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='clip-text-graph.png';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);button.textContent='PNG saved'},'image/png')}catch(error){window.alert(error.message);button.textContent='Save PNG'}finally{if(exporter)graph.detachCanvas(exporter);setTimeout(()=>{button.disabled=false;button.textContent='Save PNG'},1200)}}$('save-text-graph').addEventListener('click',saveTextGraph);'''
 	body = body.replace('id="meta"', 'id="meta" hidden')
 	return _page("Text search", body, script)
@@ -281,6 +326,20 @@ class Handler(BaseHTTPRequestHandler):
 		if path == "/text": return _send(self, HTTPStatus.OK, text_page().encode(), "text/html; charset=utf-8")
 		if path == "/graph": return _send(self, HTTPStatus.OK, graph_page().encode(), "text/html; charset=utf-8")
 		if path == "/api/health": return _json_response(self, HTTPStatus.OK, {"model": MODEL_NAME, "model_cache": str(MODEL_CACHE_DIR), "offline": LOCAL_ONLY, "cached_images": len(STORE.list()), "model_loaded": ENGINE._model is not None, "model_error": ENGINE.error})
+		if path == "/api/text/export-onnx":
+			try:
+				output_path = ENGINE.export_text_onnx()
+			except (ImportError, OSError, RuntimeError) as error:
+				LOGGER.exception("Text encoder ONNX export failed")
+				return _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+			body = output_path.read_bytes()
+			self.send_response(HTTPStatus.OK)
+			self.send_header("Content-Type", "application/octet-stream")
+			self.send_header("Content-Disposition", 'attachment; filename="clip-text-encoder.onnx"')
+			self.send_header("Content-Length", str(len(body)))
+			self.end_headers()
+			self.wfile.write(body)
+			return
 		if path == "/api/images": return _json_response(self, HTTPStatus.OK, STORE.list())
 		if path.startswith("/api/images/") and path.endswith("/vector"):
 			image_id = unquote(path.removeprefix("/api/images/").removesuffix("/vector"))
