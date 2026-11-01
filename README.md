@@ -31,6 +31,9 @@ This is intentionally a small single-process local tool. It does not include aut
 
 ## Clip
 
+CLIP Operates in an Abstract Semantic Space
+CLIP’s job is strictly text-to-vector translation. It takes a text prompt and converts it into a sequence of numbers (embeddings) that represent meaning.
+
 In a CLIP-based text-to-vector (or text-to-3D/latent generation) model, the output is typically described as a multidimensional embedding vector or a continuous latent space coordinate that aligns the semantic meaning of the text prompt with a shared joint representation space.
 
 Here is a breakdown of how that output is characterized structurally and functionally:
