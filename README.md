@@ -66,3 +66,8 @@ Latent Space Conditioning: In diffusion or latent-space mapping models, the text
 ## visualisation of multidimensional embedding vector
 
 shows just first 64 valuies of 512
+
+![alt text](image.png)
+
+![alt text](image-1.png)
+
