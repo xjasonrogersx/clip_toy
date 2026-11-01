@@ -91,3 +91,12 @@ A fluffy animal with 4 legs
 
 ![alt text](image-8.png)
 
+# dog (full 77 pad)
+![alt text](image-9.png)
+
+# things with wheels
+
+![alt text](image-10.png)
+
+![alt text](image-11.png)
+
